@@ -1,252 +1,134 @@
 package main
 
 import (
-	"bytes"
 	"encoding/base64"
-	"encoding/xml"
 	"fmt"
-	"io/ioutil"
 	"log"
-	"net/http"
-	"os"
-	"time"
+	"strings"
 
+	"./ew"
 	"github.com/amalfra/maildir"
 )
 
+var svc *ew.EW
+var cfg *config
+
+type folderState struct {
+	SyncState string     `json:"sync-state"`
+	Folder    *ew.Folder `json:"folder"`
+}
+
 func init() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-}
-
-func setSyncState(state string) {
-	log.Printf("setSyncState: %s\n", state)
-	b := []byte(state)
-	err := ioutil.WriteFile(".maildir_state", b, 0644)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func getSyncState() string {
-	if _, err := os.Stat(".maildir_state"); os.IsNotExist(err) {
-		return ""
-	}
-
-	data, err := ioutil.ReadFile(".maildir_state")
-	if err != nil {
-		panic(err)
-	}
-
-	return string(data)
-}
-
-func post(message string) ([]byte, error) {
-	client := &http.Client{}
-
-	body := bytes.NewBuffer([]byte(message))
-	req, err := http.NewRequest("POST", "https://outlook.office365.com/EWS/Exchange.asmx", body)
-	req.SetBasicAuth("user@domain.com", "password")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	res, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	return res, nil
-}
-
-type ItemId struct {
-	Id        string `xml:"Id,attr"`
-	ChangeKey string `xml:"ChangeKey,attr"`
-}
-type Create struct {
-	Message struct {
-		ItemId ItemId `xml:"ItemId"`
-	}
-}
-
-type SyncFolderItemsResponse struct {
-	XMLName xml.Name
-	Body    struct {
-		SyncFolderItemsResponse struct {
-			ResponseMessages struct {
-				SyncFolderItemsResponseMessage struct {
-					ResponseCode            string
-					SyncState               string
-					IncludesLastItemInRange bool
-					Changes                 struct {
-						Create []Create
-					}
-				}
-			}
-		}
-	}
-}
-
-func syncFolder() int {
-	syncStateElement := ""
-	syncState := getSyncState()
-	if syncState != "" {
-		syncStateElement = fmt.Sprintf("<m:SyncState>%s</m:SyncState>", syncState)
-	}
-
-	rawRequest := `<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
-               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
-               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Body>
-    <m:SyncFolderItems>
-      <m:ItemShape>
-        <t:BaseShape>IdOnly</t:BaseShape>
-      </m:ItemShape>
-      <m:SyncFolderId>
-        <t:DistinguishedFolderId Id="inbox" />
-      </m:SyncFolderId>
-      <m:MaxChangesReturned>10</m:MaxChangesReturned>` +
-		syncStateElement +
-		`<m:SyncScope>NormalItems</m:SyncScope>
-    </m:SyncFolderItems>
-  </soap:Body>
-</soap:Envelope>`
-
-	rawResponse, err := post(rawRequest)
-	if err != nil {
-		panic(err)
-	}
-
-	v := SyncFolderItemsResponse{}
-	err = xml.Unmarshal(rawResponse, &v)
-	if err != nil {
-		fmt.Println(err.Error())
-	}
-
-	//fmt.Printf("%+v\n", v)
-	for _, item := range v.Body.SyncFolderItemsResponse.ResponseMessages.SyncFolderItemsResponseMessage.Changes.Create {
-		getItem(item.Message.ItemId.Id, item.Message.ItemId.ChangeKey)
-	}
-
-	setSyncState(v.Body.SyncFolderItemsResponse.ResponseMessages.SyncFolderItemsResponseMessage.SyncState)
-
-	return len(v.Body.SyncFolderItemsResponse.ResponseMessages.SyncFolderItemsResponseMessage.Changes.Create)
-}
-
-type Message struct {
-	ItemId struct {
-		Id        string `xml:"Id,attr"`
-		ChangeKey string `xml:"ChangeKey,attr"`
-	} `xml:"ItemId"`
-	MimeContent string
-	Subject     string
-	Sensitivity string
-	Body        string
-	Attachments struct {
-		FileAttachment struct {
-			AttachmentId struct {
-				Id string `xml:"Id,attr"`
-			}
-			Name        string
-			ContentType string
-			ContentId   string
-		}
-	}
-	Size            int
-	DateTimeSent    time.Time
-	DateTimeCreated time.Time
-	HasAttachments  bool
-	From            struct {
-		Mailbox struct {
-			Name         string
-			EmailAddress string
-			RoutingType  string
-		}
-	}
-	IsRead bool
-}
-
-type MessageResponse struct {
-	XMLName xml.Name
-	Body    struct {
-		XMLName         xml.Name
-		GetItemResponse struct {
-			XMLName          xml.Name
-			ResponseMessages struct {
-				XMLName                xml.Name
-				GetItemResponseMessage struct {
-					XMLName       xml.Name
-					ResponseClass string `xml:"ResponseClass,attr"`
-					ResponseCode  string `xml:"ResponseCode"`
-					Items         struct {
-						XMLName xml.Name
-						Message Message `xml:"Message"`
-					} `xml:"Items"`
-				} `xml:"GetItemResponseMessage"`
-			} `xml:"ResponseMessages"`
-		} `xml:"GetItemResponse"`
-	} `xml:"Body"`
-}
-
-func getItem(id, key string) {
-	fmt.Printf("Fetching %s %s\n", id, key)
-	rawRequest := fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope
-  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-  xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-  xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
-  <soap:Body>
-    <GetItem
-      xmlns="http://schemas.microsoft.com/exchange/services/2006/messages"
-      xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
-      <ItemShape>
-        <t:BaseShape>IdOnly</t:BaseShape>
-        <t:IncludeMimeContent>true</t:IncludeMimeContent>
-      </ItemShape>
-      <ItemIds>
-        <t:ItemId Id="%s" ChangeKey="%s" />
-      </ItemIds>
-    </GetItem>
-  </soap:Body>
-</soap:Envelope>`, id, key)
-
-	rawResponse, err := post(rawRequest)
-	if err != nil {
-		panic(err)
-	}
-
-	//fmt.Println(string(rawResponse))
-	v := MessageResponse{}
-	err = xml.Unmarshal(rawResponse, &v)
-	if err != nil {
-		fmt.Println(err.Error())
-	}
-
-	//fmt.Printf("%+v\n", v)
-	m := v.Body.GetItemResponse.ResponseMessages.GetItemResponseMessage.Items.Message.MimeContent
-	decoded, err := base64.StdEncoding.DecodeString(m)
-	if err != nil {
-		fmt.Println("decode error:", err)
-		return
-	}
-	//fmt.Println(string(decoded))
-
-	d := maildir.NewMaildir(".maildir")
-	_, err = d.Add(string(decoded))
-	if err != nil {
-		panic(err)
-	}
+	cfg = readConfig()
 }
 
 func main() {
+
+	for _, account := range cfg.Accounts {
+		svc = ew.NewEW(account.Login, account.Password)
+
+		for _, f := range account.Folders {
+			path := f.Remote
+			state := readState(account, path)
+
+			var folder *ew.Folder
+			var err error
+			if state.Folder == nil || state.Folder.FolderId.Id == "" {
+				folder, err = findFolder(svc, path)
+				if err != nil {
+					panic(err)
+				}
+			} else {
+				resp, err := svc.GetFolder(state.Folder.FolderId.Id, state.Folder.FolderId.ChangeKey)
+				if err != nil {
+					panic(err)
+				}
+
+				folder = resp.Body.GetFolderResponse.ResponseMessages.GetFolderResponseMessage.Folders.Folder[0]
+			}
+			state.Folder = folder
+			saveState(account, path, state)
+
+			syncFolder(folder, account, path, state)
+		}
+	}
+}
+
+func findFolder(svc *ew.EW, path string) (*ew.Folder, error) {
+	parts := strings.Split(path, "/")
+	root, err := svc.GetFolder(parts[0], "")
+	if err != nil {
+		return nil, err
+	}
+
+	rootFolder := root.Body.GetFolderResponse.ResponseMessages.GetFolderResponseMessage.Folders.Folder[0]
+	rootId := rootFolder.FolderId.Id
+	folderId := rootId
+	result := rootFolder
+	for _, part := range parts[1:] {
+		fmt.Println(part)
+		folder, err := svc.FindFolder(folderId)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, i := range folder.Body.FindFolderResponse.ResponseMessages.FindFolderResponseMessage.RootFolder.Folders.Folder {
+			if part == i.DisplayName {
+				folderId = i.FolderId.Id
+				result = i
+			}
+		}
+	}
+
+	return result, nil
+}
+
+func syncFolder(folder *ew.Folder, account *Account, path string, state *folderState) {
+	log.Printf("Syncing folder %s\n", path)
+
 	for {
-		n := syncFolder()
-		fmt.Printf("Sync %d items\n", n)
-		if n < 1 {
+		v, err := svc.SyncFolderItems(folder.FolderId.Id, folder.FolderId.ChangeKey, state.SyncState)
+		if err != nil {
+			panic(err)
+		}
+
+		d := maildir.NewMaildir(account.Maildir + "/" + path)
+
+		resp := v.Body.SyncFolderItemsResponse.ResponseMessages.SyncFolderItemsResponseMessage
+		state.SyncState = resp.SyncState
+		items := make([]*ew.ItemId, 0)
+		for _, item := range resp.Changes.Create {
+			if item.Message == nil {
+				continue
+			}
+			items = append(items, &item.Message.ItemId)
+		}
+
+		log.Printf("==> getting %d items \n", len(items))
+		v2, err := svc.GetItem(items)
+		if err != nil {
+			panic(err)
+		}
+
+		for _, m := range v2.Body.GetItemResponse.ResponseMessages.GetItemResponseMessage.Items.Message {
+			decoded, err := base64.StdEncoding.DecodeString(m.MimeContent)
+			if err != nil {
+				fmt.Println("decode error:", err)
+				return
+			}
+
+			_, err = d.Add(string(decoded))
+			if err != nil {
+				panic(err)
+			}
+
+		}
+
+		if resp.IncludesLastItemInRange {
 			break
 		}
 	}
+
+	saveState(account, path, state)
 }
